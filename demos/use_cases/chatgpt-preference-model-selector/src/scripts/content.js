@@ -1,56 +1,118 @@
+// content.js
+
 (() => {
-  const TAG = "[ModelSelector]";
+  const TAG = '[ModelSelector]';
 
-  // Find the model selector button by visible label
-  const findSelectorButton = () =>
-    [...document.querySelectorAll('button')].find(
-      btn => btn.textContent.match(/GPT|Default|4o/i)
-    );
-
-  let selectorButton = findSelectorButton();
-  if (!selectorButton) {
-    console.warn(`${TAG} Model selector button not found—will retry on DOM changes.`);
-  } else {
-    console.log(`${TAG} Listener attached to model selector.`);
-    selectorButton.addEventListener('click', () => {
-      console.log(`${TAG} Model selector clicked (dropdown opening).`);
+  /**─────────────────────── 0️⃣ Broadcast initial settings ───────────────────────**/
+  chrome.storage.sync.get(['preferences','defaultModel'], settings => {
+    window.postMessage({ type: 'PBMS_SETTINGS', settings }, '*');
+  });
+  chrome.storage.onChanged.addListener(() => {
+    chrome.storage.sync.get(['preferences','defaultModel'], settings => {
+      window.postMessage({ type: 'PBMS_SETTINGS', settings }, '*');
     });
-  }
-
-  // Observe for late loads or UI updates
-  const initObserver = new MutationObserver(() => {
-    if (!selectorButton) {
-      selectorButton = findSelectorButton();
-      if (selectorButton) {
-        console.log(`${TAG} (late) Listener attached to model selector.`);
-        selectorButton.addEventListener('click', () => {
-          console.log(`${TAG} Model selector clicked (dropdown opening).`);
-        });
-      }
-    }
   });
-  initObserver.observe(document.body, { childList: true, subtree: true });
 
-  // Observe dropdown insertions
-  const menuObserver = new MutationObserver(mutations => {
-    for (const m of mutations) {
-      for (const node of m.addedNodes) {
-        if (
-          node.nodeType === 1 &&
-          node.querySelector &&
-          node.querySelector('[role="menu"]')
-        ) {
-          console.log(`${TAG} Dropdown menu opened.`);
-          node.querySelectorAll('[role="menuitem"]').forEach(item => {
-            item.addEventListener('click', () => {
-              console.log(`${TAG} Model selected →`, item.innerText.trim());
-            });
-          });
+  /**─────────────────────── 1️⃣ Inject page-context fetch override ───────────────────────**/
+  (function injectPageFetchOverride() {
+    const injectorTag = '[ModelSelector][Injector]';
+    const s = document.createElement('script');
+    s.src = chrome.runtime.getURL('pageFetchOverride.js');
+    s.onload = () => {
+      console.log(`${injectorTag} loaded pageFetchOverride.js`);
+      s.remove();
+    };
+    (document.head || document.documentElement).appendChild(s);
+  })();
+
+  /**─────────────────────── 2️⃣ Handle proxied fetch from the page ───────────────────────**/
+  window.addEventListener('message', ev => {
+    console.log('[ModelSelector] page→content message', ev.data, ev.ports);
+    if (ev.source !== window || ev.data?.type !== 'ARCHGW_FETCH') return;
+    const { url, init } = ev.data;
+    const port = ev.ports[0];
+
+    (async () => {
+      try {
+        const res = await fetch(url, init);
+        const reader = res.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            port.postMessage({ done: true });
+            break;
+          } else {
+            port.postMessage({ chunk: value.buffer }, [value.buffer]);
+          }
         }
+      } catch (err) {
+        console.error(`${TAG} proxy fetch error`, err);
+        port.postMessage({ done: true });
       }
+    })();
+  });
+
+  /**─────────────────────── 3️⃣ DOM patch for model selector label ───────────────────────**/
+  let desiredModel = null;
+  function patchDom() {
+    if (desiredModel == null) return;
+    const btn = document.querySelector('[data-testid="model-switcher-dropdown-button"]');
+    if (!btn) return;
+    const span = btn.querySelector('span.text-token-text-tertiary') || btn.querySelector('span');
+    const wantLabel = `Model selector, current model is ${desiredModel}`;
+    if (span && span.textContent !== desiredModel) span.textContent = desiredModel;
+    if (btn.getAttribute('aria-label') !== wantLabel) btn.setAttribute('aria-label', wantLabel);
+  }
+  const observer = new MutationObserver(patchDom);
+  observer.observe(document.body || document.documentElement, {
+    subtree: true, childList: true, characterData: true, attributes: true
+  });
+  chrome.storage.sync.get(['defaultModel'], ({ defaultModel }) => {
+    if (defaultModel) { desiredModel = defaultModel; patchDom(); }
+  });
+  chrome.runtime.onMessage.addListener(msg => {
+    if (msg.action === 'applyModelSelection' && msg.model) {
+      desiredModel = msg.model;
+      patchDom();
     }
   });
-  menuObserver.observe(document.body, { childList: true, subtree: true });
 
-  console.log(`${TAG} Content script injected.`);
+  /**─────────────────────── 4️⃣ Modal / dropdown interception ───────────────────────**/
+  function showModal() {
+    if (document.getElementById('pbms-overlay')) return;
+    const overlay = document.createElement('div');
+    overlay.id = 'pbms-overlay';
+    Object.assign(overlay.style, {
+      position:'fixed', top:0, left:0,
+      width:'100vw', height:'100vh',
+      background:'rgba(0,0,0,0.4)',
+      display:'flex', alignItems:'center', justifyContent:'center',
+      zIndex:2147483647
+    });
+    const iframe = document.createElement('iframe');
+    iframe.src = chrome.runtime.getURL('index.html');
+    Object.assign(iframe.style,{
+      width:'500px', height:'600px',
+      border:0, borderRadius:'8px',
+      boxShadow:'0 4px 16px rgba(0,0,0,0.2)',
+      background:'white', zIndex:2147483648
+    });
+    overlay.addEventListener('click', e => e.target===overlay && overlay.remove());
+    overlay.appendChild(iframe);
+    document.body.appendChild(overlay);
+  }
+  function interceptDropdown(ev) {
+    if (!ev.target.closest('button[aria-haspopup="menu"]')) return;
+    ev.preventDefault(); ev.stopPropagation();
+    showModal();
+  }
+  document.addEventListener('pointerdown', interceptDropdown, true);
+  document.addEventListener('mousedown', interceptDropdown, true);
+  window.addEventListener('message', ev => {
+    if (ev.data?.action === 'CLOSE_PBMS_MODAL') {
+      document.getElementById('pbms-overlay')?.remove();
+    }
+  });
+
+  console.log(`${TAG} content script initialized`);
 })();
